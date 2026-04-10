@@ -196,6 +196,33 @@ def _get_playurl(bvid: str, cid: int, qn: int = 80) -> dict:
     return _wbi_get_json(url)
 
 
+def _ensure_1080p_available(playurl_resp: dict) -> None:
+    """没有 1080P( qn=80 )就不下载。"""
+    data = playurl_resp.get("data", {}) if isinstance(playurl_resp, dict) else {}
+    if not isinstance(data, dict):
+        raise RuntimeError("playurl 返回结构异常")
+
+    accept = data.get("accept_quality", [])
+    if isinstance(accept, list) and accept:
+        try:
+            accept_int = {int(x) for x in accept}
+        except Exception:
+            accept_int = set()
+        if 80 not in accept_int:
+            raise RuntimeError("该视频不提供 1080P（80），已按设置跳过下载")
+        return
+
+    # 兜底：有些情况下 accept_quality 为空，改查 dash.video 的 id
+    dash = data.get("dash", {})
+    videos = dash.get("video", []) if isinstance(dash, dict) else []
+    try:
+        qids = {int(v.get("id", -1)) for v in videos if isinstance(v, dict)}
+    except Exception:
+        qids = set()
+    if 80 not in qids:
+        raise RuntimeError("该视频不提供 1080P（80），已按设置跳过下载")
+
+
 def _pick_best_dash(playurl_data: dict) -> tuple[str, str]:
     data = playurl_data.get("data", {}) if isinstance(playurl_data, dict) else {}
     dash = data.get("dash", {}) if isinstance(data, dict) else {}
@@ -295,7 +322,9 @@ def download_single(url_or_bvid: str, out_dir: Path) -> Path:
     else:
         cid = int(vdata.get("cid"))
 
+    # 强制 1080P：没有 1080P 就不下载
     playurl = _get_playurl(bvid, cid, qn=80)
+    _ensure_1080p_available(playurl)
     v_url, a_url = _pick_best_dash(playurl)
 
     temp_dir = out_dir / "_tmp" / bvid
