@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import json
+import importlib
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
@@ -25,6 +26,19 @@ from util.parse.parser.base import ParserBase  # type: ignore  # noqa: E402
 DEFAULT_URL = "https://www.bilibili.com/video/BV1nhCGYpECj/"
 COOKIES_DIR = ROOT / "cookies"
 _COOKIE_OVERRIDE: Path | None = None
+
+
+def _get_default_output_dir() -> Path:
+    """默认输出目录来自项目根目录的 `config.py`。"""
+    try:
+        # 这里 import 的是项目根目录下的 config.py（不是 util.common.config）
+        local_cfg = importlib.import_module("config")
+        p = getattr(local_cfg, "DOWNLOAD_OUTPUT_DIR", None)
+        if p:
+            return Path(p).expanduser()
+    except Exception:
+        pass
+    return Path.cwd() / "downloads"
 
 
 def _load_cookie_file(path: Path) -> dict:
@@ -357,7 +371,7 @@ def download_single(url_or_bvid: str, out_dir: Path) -> Path:
 def main() -> None:
     ap = argparse.ArgumentParser(description="下载 bilibili 单个视频（BV 链接）")
     ap.add_argument("url", nargs="?", default=DEFAULT_URL, help="视频链接或 BV 号（默认用脚本内置示例）")
-    ap.add_argument("-o", "--out", default=str(Path.cwd() / "downloads"), help="输出目录")
+    ap.add_argument("-o", "--out", default=str(_get_default_output_dir()), help="输出目录（默认读 config.py 的 DOWNLOAD_OUTPUT_DIR）")
     ap.add_argument("--cookie", default="", help="指定 cookies 文件（json）。不填则自动使用 cookies/ 下最新可用文件")
     args = ap.parse_args()
 
