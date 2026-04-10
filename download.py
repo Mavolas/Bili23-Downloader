@@ -274,6 +274,24 @@ def _pick_best_dash(playurl_data: dict) -> tuple[str, str]:
     return v_url, a_url
 
 
+def _pick_1080p_video_only(playurl_data: dict) -> str:
+    """只取 1080P 视频流（qn=80），不取音频。"""
+    data = playurl_data.get("data", {}) if isinstance(playurl_data, dict) else {}
+    dash = data.get("dash", {}) if isinstance(data, dict) else {}
+
+    videos = dash.get("video", []) if isinstance(dash, dict) else []
+    videos_1080 = [v for v in videos if isinstance(v, dict) and int(v.get("id", -1)) == 80]
+    if not videos_1080:
+        raise RuntimeError("未找到 1080P（80）的 DASH 视频流")
+
+    # 1080P 内部可能有不同 codec/码率，取带宽最高的
+    best = max(videos_1080, key=lambda x: (x.get("bandwidth", 0), x.get("codecid", 0)))
+    v_url = best.get("baseUrl") or best.get("base_url") or ""
+    if not v_url:
+        raise RuntimeError("1080P 视频流缺少 baseUrl")
+    return v_url
+
+
 def _download_stream(url: str, out_path: Path, referer: str) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     headers = {"Referer": referer, "User-Agent": config.get(config.user_agent)}
@@ -320,6 +338,39 @@ def _merge_ffmpeg(video_path: Path, audio_path: Path, out_path: Path) -> bool:
     return True
 
 
+def _segment_video_ffmpeg(input_path: Path, out_dir: Path, base_name: str, segment_seconds: int = 600) -> list[Path]:
+    """使用 ffmpeg 按固定时长无损切片（仅视频）。"""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("未检测到 ffmpeg，无法按 10 分钟切片")
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # 输出为 mp4 片段（更适合作为剪辑素材），按时间切片并重置时间戳
+    out_pattern = out_dir / f"{base_name}_%03d.mp4"
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-i",
+        str(input_path),
+        "-map",
+        "0:v:0",
+        "-c",
+        "copy",
+        "-f",
+        "segment",
+        "-segment_time",
+        str(int(segment_seconds)),
+        "-reset_timestamps",
+        "1",
+        str(out_pattern),
+    ]
+    p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if p.returncode != 0:
+        raise RuntimeError(f"ffmpeg 切片失败：\n{p.stderr.strip()}")
+
+    return sorted(out_dir.glob(f"{base_name}_*.mp4"))
+
+
 def download_single(url_or_bvid: str, out_dir: Path) -> Path:
     _init_wbi_keys()
 
@@ -339,33 +390,34 @@ def download_single(url_or_bvid: str, out_dir: Path) -> Path:
     # 强制 1080P：没有 1080P 就不下载
     playurl = _get_playurl(bvid, cid, qn=80)
     _ensure_1080p_available(playurl)
-    v_url, a_url = _pick_best_dash(playurl)
+    v_url = _pick_1080p_video_only(playurl)
 
     temp_dir = out_dir / "_tmp" / bvid
     video_path = temp_dir / "video.m4s"
-    audio_path = temp_dir / "audio.m4s"
-    merged_path = out_dir / f"{title}.mp4"
+    segments_dir = out_dir / f"{title}_segments"
 
     print(f"标题: {title}")
     print(f"BV: {bvid}  CID: {cid}")
 
     _download_stream(v_url, video_path, referer=referer)
-    _download_stream(a_url, audio_path, referer=referer)
 
-    if _merge_ffmpeg(video_path, audio_path, merged_path):
-        print(f"已合并输出: {merged_path}")
-        return merged_path
-
-    # 没有 ffmpeg 就保留分离文件
-    fallback_video = out_dir / f"{title}.video.m4s"
-    fallback_audio = out_dir / f"{title}.audio.m4s"
-    fallback_video.parent.mkdir(parents=True, exist_ok=True)
-    fallback_video.write_bytes(video_path.read_bytes())
-    fallback_audio.write_bytes(audio_path.read_bytes())
-    print("未检测到 ffmpeg，已输出分离文件:")
-    print(f"- {fallback_video}")
-    print(f"- {fallback_audio}")
-    return fallback_video
+    # 切片（10 分钟一段）
+    try:
+        segs = _segment_video_ffmpeg(video_path, segments_dir, base_name=title, segment_seconds=600)
+        if segs:
+            print(f"已切片输出（{len(segs)} 段）: {segments_dir}")
+            return segs[0]
+        else:
+            raise RuntimeError("切片未产生输出文件")
+    except Exception as e:
+        # 没有 ffmpeg 或切片失败：至少保留 video.m4s
+        fallback_video = out_dir / f"{title}.video.m4s"
+        fallback_video.parent.mkdir(parents=True, exist_ok=True)
+        fallback_video.write_bytes(video_path.read_bytes())
+        print(f"切片失败或未安装 ffmpeg：{e}")
+        print("已输出原始视频流文件（无音频）:")
+        print(f"- {fallback_video}")
+        return fallback_video
 
 
 def main() -> None:
