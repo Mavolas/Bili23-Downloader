@@ -23,9 +23,25 @@ from util.network.request import SyncNetWorkRequest, get_cookies  # type: ignore
 from util.parse.parser.base import ParserBase  # type: ignore  # noqa: E402
 
 
-DEFAULT_URL = "https://www.bilibili.com/video/BV1nhCGYpECj/"
+DEFAULT_URL = ""
+DEFAULT_LIST_FILE = ROOT / "download-list.txt"
 COOKIES_DIR = ROOT / "cookies"
 _COOKIE_OVERRIDE: Path | None = None
+
+
+def _read_download_list(list_path: Path) -> list[str]:
+    """一行一个链接；空行跳过；# 开头视为注释。"""
+    if not list_path.is_file():
+        raise FileNotFoundError(f"列表文件不存在: {list_path}")
+    urls: list[str] = []
+    for raw in list_path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            continue
+        urls.append(line)
+    return urls
 
 
 def _get_default_output_dir() -> Path:
@@ -421,9 +437,19 @@ def download_single(url_or_bvid: str, out_dir: Path) -> Path:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="下载 bilibili 单个视频（BV 链接）")
-    ap.add_argument("url", nargs="?", default=DEFAULT_URL, help="视频链接或 BV 号（默认用脚本内置示例）")
+    ap = argparse.ArgumentParser(description="下载 bilibili 视频（单链接或列表文件）")
+    ap.add_argument(
+        "url",
+        nargs="?",
+        default=None,
+        help="单个视频链接或 BV；不传则从列表文件读取（默认 download-list.txt）",
+    )
     ap.add_argument("-o", "--out", default=str(_get_default_output_dir()), help="输出目录（默认读 config.py 的 DOWNLOAD_OUTPUT_DIR）")
+    ap.add_argument(
+        "--list",
+        default=str(DEFAULT_LIST_FILE),
+        help=f"下载列表路径，一行一个链接，空行跳过（默认: {DEFAULT_LIST_FILE.name}）",
+    )
     ap.add_argument("--cookie", default="", help="指定 cookies 文件（json）。不填则自动使用 cookies/ 下最新可用文件")
     args = ap.parse_args()
 
@@ -431,7 +457,25 @@ def main() -> None:
     if args.cookie:
         global _COOKIE_OVERRIDE
         _COOKIE_OVERRIDE = Path(args.cookie).expanduser().resolve()
-    download_single(args.url, out_dir)
+
+    if args.url:
+        download_single(args.url, out_dir)
+        return
+
+    list_path = Path(args.list).expanduser().resolve()
+    urls = _read_download_list(list_path)
+    if not urls:
+        print(f"列表为空或无可下载行: {list_path}")
+        return
+
+    print(f"从列表读取 {len(urls)} 条: {list_path}")
+    for i, u in enumerate(urls, 1):
+        print(f"\n===== [{i}/{len(urls)}] {u} =====")
+        try:
+            download_single(u, out_dir)
+        except Exception as e:
+            print(f"跳过（失败）: {e}")
+            continue
 
 
 if __name__ == "__main__":
