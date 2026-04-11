@@ -7,6 +7,7 @@ import subprocess
 import sys
 import json
 import importlib
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
@@ -72,6 +73,7 @@ def _get_local_download_settings() -> dict:
         "VIDEO_TRIM_START_MINUTES": 0.0,
         "VIDEO_TRIM_END_MINUTES": 0.0,
         "VIDEO_SEGMENT_MINUTES": 10.0,
+        "DOWNLOAD_LIST_MAX_WORKERS": 1,
     }
     try:
         m = importlib.import_module("config")
@@ -80,6 +82,8 @@ def _get_local_download_settings() -> dict:
         for key in ("VIDEO_TRIM_START_MINUTES", "VIDEO_TRIM_END_MINUTES", "VIDEO_SEGMENT_MINUTES"):
             if hasattr(m, key):
                 settings[key] = float(getattr(m, key))
+        if hasattr(m, "DOWNLOAD_LIST_MAX_WORKERS"):
+            settings["DOWNLOAD_LIST_MAX_WORKERS"] = max(1, min(32, int(getattr(m, "DOWNLOAD_LIST_MAX_WORKERS"))))
     except Exception:
         pass
     if settings["VIDEO_SEGMENT_MINUTES"] <= 0:
@@ -575,6 +579,14 @@ def download_single(
         return fallback_video
 
 
+def _run_list_download_worker(url: str, out_dir_str: str, cookie_path_str: str = "") -> None:
+    """列表多任务时由子进程执行；每个进程独立，单视频仍为单连接流式下载。"""
+    global _COOKIE_OVERRIDE
+    if cookie_path_str:
+        _COOKIE_OVERRIDE = Path(cookie_path_str).expanduser().resolve()
+    download_single(url, Path(out_dir_str), source_line=url)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="下载 bilibili 视频（单链接或列表文件）")
     ap.add_argument(
@@ -608,13 +620,35 @@ def main() -> None:
         return
 
     print(f"从列表读取 {len(urls)} 条: {list_path}")
-    for i, u in enumerate(urls, 1):
-        print(f"\n===== [{i}/{len(urls)}] {u} =====")
-        try:
-            download_single(u, out_dir, source_line=u)
-        except Exception as e:
-            print(f"跳过（失败）: {e}")
-            continue
+
+    local = _get_local_download_settings()
+    workers = max(1, min(int(local.get("DOWNLOAD_LIST_MAX_WORKERS", 1)), len(urls)))
+    cookie_arg = str(Path(args.cookie).expanduser().resolve()) if args.cookie else ""
+
+    if workers == 1:
+        for i, u in enumerate(urls, 1):
+            print(f"\n===== [{i}/{len(urls)}] {u} =====")
+            try:
+                download_single(u, out_dir, source_line=u)
+            except Exception as e:
+                print(f"跳过（失败）: {e}")
+                continue
+        return
+
+    print(f"列表并行下载进程数: {workers}（单文件仍为单线程）")
+    out_str = str(out_dir)
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(_run_list_download_worker, u, out_str, cookie_arg): u
+            for u in urls
+        }
+        for fut in as_completed(futures):
+            u = futures[fut]
+            try:
+                fut.result()
+                print(f"\n[完成] {u}")
+            except Exception as e:
+                print(f"\n[跳过] {u}\n失败原因: {e}")
 
 
 if __name__ == "__main__":
