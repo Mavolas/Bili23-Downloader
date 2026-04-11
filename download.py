@@ -25,8 +25,29 @@ from util.parse.parser.base import ParserBase  # type: ignore  # noqa: E402
 
 DEFAULT_URL = ""
 DEFAULT_LIST_FILE = ROOT / "download-list.txt"
+SUCCESS_LOG_FILE = ROOT / "success.txt"
 COOKIES_DIR = ROOT / "cookies"
 _COOKIE_OVERRIDE: Path | None = None
+
+
+def _append_success_record(
+    bvid: str,
+    segment_count: int,
+    trim_start_minutes: float,
+    trim_end_minutes: float,
+    segment_minutes: float,
+) -> None:
+    """下载成功时追加一行（全角逗号分隔）：
+    规范链接，段数，开头截取分钟，结尾截取分钟，每段分钟。
+    链接固定为 https://www.bilibili.com/video/{BV}（无查询参数）。
+    """
+    short_url = f"https://www.bilibili.com/video/{(bvid or '').strip()}"
+    rec = (
+        f"{short_url}，{int(segment_count)}，"
+        f"{trim_start_minutes:g}，{trim_end_minutes:g}，{segment_minutes:g}\n"
+    )
+    with open(SUCCESS_LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(rec)
 
 
 def _read_download_list(list_path: Path) -> list[str]:
@@ -44,17 +65,79 @@ def _read_download_list(list_path: Path) -> list[str]:
     return urls
 
 
-def _get_default_output_dir() -> Path:
-    """默认输出目录来自项目根目录的 `config.py`。"""
+def _get_local_download_settings() -> dict:
+    """读取项目根目录 `config.py` 中的下载相关配置（缺省用内置默认值）。"""
+    settings = {
+        "DOWNLOAD_OUTPUT_DIR": Path.cwd() / "downloads",
+        "VIDEO_TRIM_START_MINUTES": 0.0,
+        "VIDEO_TRIM_END_MINUTES": 0.0,
+        "VIDEO_SEGMENT_MINUTES": 10.0,
+    }
     try:
-        # 这里 import 的是项目根目录下的 config.py（不是 util.common.config）
-        local_cfg = importlib.import_module("config")
-        p = getattr(local_cfg, "DOWNLOAD_OUTPUT_DIR", None)
-        if p:
-            return Path(p).expanduser()
+        m = importlib.import_module("config")
+        if getattr(m, "DOWNLOAD_OUTPUT_DIR", None) is not None:
+            settings["DOWNLOAD_OUTPUT_DIR"] = Path(m.DOWNLOAD_OUTPUT_DIR).expanduser()
+        for key in ("VIDEO_TRIM_START_MINUTES", "VIDEO_TRIM_END_MINUTES", "VIDEO_SEGMENT_MINUTES"):
+            if hasattr(m, key):
+                settings[key] = float(getattr(m, key))
     except Exception:
         pass
-    return Path.cwd() / "downloads"
+    if settings["VIDEO_SEGMENT_MINUTES"] <= 0:
+        settings["VIDEO_SEGMENT_MINUTES"] = 10.0
+    return settings
+
+
+def _get_default_output_dir() -> Path:
+    """默认输出目录来自项目根目录的 `config.py`。"""
+    return Path(_get_local_download_settings()["DOWNLOAD_OUTPUT_DIR"]).expanduser()
+
+
+def _ffprobe_duration_seconds(path: Path) -> float:
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        raise RuntimeError("未检测到 ffprobe，无法获取视频时长（请安装 ffmpeg 套件）")
+    cmd = [
+        ffprobe,
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(path),
+    ]
+    p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if p.returncode != 0:
+        raise RuntimeError(f"ffprobe 失败：\n{p.stderr.strip()}")
+    return float((p.stdout or "").strip())
+
+
+def _trim_video_ffmpeg(input_path: Path, output_path: Path, start_sec: float, duration_sec: float) -> None:
+    """仅视频流：从 start_sec 起保留 duration_sec 秒（-c copy）。"""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("未检测到 ffmpeg，无法裁剪片头片尾")
+    if duration_sec <= 0:
+        raise RuntimeError("裁剪后时长必须大于 0")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-i",
+        str(input_path),
+        "-ss",
+        str(start_sec),
+        "-t",
+        str(duration_sec),
+        "-map",
+        "0:v:0",
+        "-c",
+        "copy",
+        str(output_path),
+    ]
+    pr = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if pr.returncode != 0:
+        raise RuntimeError(f"ffmpeg 裁剪失败：\n{pr.stderr.strip()}")
 
 
 def _load_cookie_file(path: Path) -> dict:
@@ -354,11 +437,11 @@ def _merge_ffmpeg(video_path: Path, audio_path: Path, out_path: Path) -> bool:
     return True
 
 
-def _segment_video_ffmpeg(input_path: Path, out_dir: Path, base_name: str, segment_seconds: int = 600) -> list[Path]:
+def _segment_video_ffmpeg(input_path: Path, out_dir: Path, base_name: str, segment_seconds: float = 600.0) -> list[Path]:
     """使用 ffmpeg 按固定时长无损切片（仅视频）。"""
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
-        raise RuntimeError("未检测到 ffmpeg，无法按 10 分钟切片")
+        raise RuntimeError("未检测到 ffmpeg，无法按时长切片")
 
     out_dir.mkdir(parents=True, exist_ok=True)
     # 输出为 mp4 片段（更适合作为剪辑素材），按时间切片并重置时间戳
@@ -375,7 +458,7 @@ def _segment_video_ffmpeg(input_path: Path, out_dir: Path, base_name: str, segme
         "-f",
         "segment",
         "-segment_time",
-        str(int(segment_seconds)),
+        str(float(segment_seconds)),
         "-reset_timestamps",
         "1",
         str(out_pattern),
@@ -387,7 +470,12 @@ def _segment_video_ffmpeg(input_path: Path, out_dir: Path, base_name: str, segme
     return sorted(out_dir.glob(f"{base_name}_*.mp4"))
 
 
-def download_single(url_or_bvid: str, out_dir: Path) -> Path:
+def download_single(
+    url_or_bvid: str,
+    out_dir: Path,
+    *,
+    source_line: str | None = None,
+) -> Path:
     _init_wbi_keys()
 
     bvid = _extract_bvid(url_or_bvid)
@@ -412,16 +500,59 @@ def download_single(url_or_bvid: str, out_dir: Path) -> Path:
     video_path = temp_dir / "video.m4s"
     segments_dir = out_dir / f"{title}_segments"
 
+    local = _get_local_download_settings()
+    trim_start_min = float(local["VIDEO_TRIM_START_MINUTES"])
+    trim_end_min = float(local["VIDEO_TRIM_END_MINUTES"])
+    segment_min = float(local["VIDEO_SEGMENT_MINUTES"])
+    segment_seconds = segment_min * 60.0
+
     print(f"标题: {title}")
     print(f"BV: {bvid}  CID: {cid}")
+    print(
+        f"成片处理: 片头删 {trim_start_min:g} 分钟, 片尾删 {trim_end_min:g} 分钟, 每段 {segment_min:g} 分钟"
+    )
 
     _download_stream(v_url, video_path, referer=referer)
 
-    # 切片（10 分钟一段）
+    # 先按配置去掉片头片尾，再按每段时长切片
     try:
-        segs = _segment_video_ffmpeg(video_path, segments_dir, base_name=title, segment_seconds=600)
+        trim_start_sec = trim_start_min * 60.0
+        trim_end_sec = trim_end_min * 60.0
+        try:
+            total_sec = _ffprobe_duration_seconds(video_path)
+        except Exception as e:
+            # 接口 duration 一般为秒（整数）
+            total_sec = float(int(vdata.get("duration") or 0))
+            if total_sec <= 0:
+                raise RuntimeError(
+                    "无法获取视频时长（ffprobe 失败且接口未返回有效 duration）"
+                ) from e
+
+        middle_sec = total_sec - trim_start_sec - trim_end_sec
+        if middle_sec <= 0:
+            raise RuntimeError(
+                f"片头片尾裁剪后无剩余内容（总时长约 {total_sec:.1f}s，片头 {trim_start_sec:.1f}s + 片尾 {trim_end_sec:.1f}s）"
+            )
+
+        if trim_start_sec > 0 or trim_end_sec > 0:
+            trimmed_path = temp_dir / "trimmed.mp4"
+            _trim_video_ffmpeg(video_path, trimmed_path, trim_start_sec, middle_sec)
+            work_input = trimmed_path
+        else:
+            work_input = video_path
+
+        segs = _segment_video_ffmpeg(
+            work_input, segments_dir, base_name=title, segment_seconds=segment_seconds
+        )
         if segs:
             print(f"已切片输出（{len(segs)} 段）: {segments_dir}")
+            _append_success_record(
+                bvid,
+                len(segs),
+                trim_start_min,
+                trim_end_min,
+                segment_min,
+            )
             return segs[0]
         else:
             raise RuntimeError("切片未产生输出文件")
@@ -433,6 +564,14 @@ def download_single(url_or_bvid: str, out_dir: Path) -> Path:
         print(f"切片失败或未安装 ffmpeg：{e}")
         print("已输出原始视频流文件（无音频）:")
         print(f"- {fallback_video}")
+        # 整文件一份，段数记为 1（未按配置切成多段）
+        _append_success_record(
+            bvid,
+            1,
+            trim_start_min,
+            trim_end_min,
+            segment_min,
+        )
         return fallback_video
 
 
@@ -459,7 +598,7 @@ def main() -> None:
         _COOKIE_OVERRIDE = Path(args.cookie).expanduser().resolve()
 
     if args.url:
-        download_single(args.url, out_dir)
+        download_single(args.url, out_dir, source_line=args.url)
         return
 
     list_path = Path(args.list).expanduser().resolve()
@@ -472,7 +611,7 @@ def main() -> None:
     for i, u in enumerate(urls, 1):
         print(f"\n===== [{i}/{len(urls)}] {u} =====")
         try:
-            download_single(u, out_dir)
+            download_single(u, out_dir, source_line=u)
         except Exception as e:
             print(f"跳过（失败）: {e}")
             continue
